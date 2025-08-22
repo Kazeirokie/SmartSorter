@@ -11,10 +11,10 @@ class SmartSorterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SmartSorter (Created by: Aminul)")
-        self.geometry("1000x550")
+        self.geometry("1000x600") # Increased height for better logging view
 
         # --- Backend Logic (encapsulated) ---
-        self.VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv']
+        self.VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv', '.webm']
         self.THUMBNAIL_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
         self.DECREMENT_STEP = 0.05
 
@@ -101,13 +101,26 @@ class SmartSorterApp(tk.Tk):
             try:
                 with open(filepath, mode='r', encoding='utf-8-sig', errors='ignore') as csvfile:
                     reader = csv.DictReader(csvfile)
-                    headers = reader.fieldnames
-                    title_key = next((h for h in headers if h.lower() == 'title'), None)
-                    index_key = next((h for h in headers if h.lower() == 'index'), None)
+                    headers = [h.lower() for h in reader.fieldnames]
+                    title_key = next((h for h in reader.fieldnames if h.lower() == 'title'), None)
+                    index_key = next((h for h in reader.fieldnames if h.lower() == 'index'), None)
+                    url_key = next((h for h in reader.fieldnames if h.lower() == 'url'), None)
+
                     if not title_key or not index_key:
                         self.log(f"--- ERROR: CSV must contain 'title' and 'index' columns (case-insensitive).")
                         return None
-                    for row in reader: video_data.append({'title': row[title_key], 'index': row[index_key]})
+                    
+                    if url_key:
+                        self.log("--- Found 'url' column. Will prioritize URL matching.")
+                    else:
+                        self.log("--- No 'url' column found. Proceeding with title matching only.")
+
+                    for row in reader:
+                        entry = {'title': row[title_key], 'index': row[index_key]}
+                        if url_key and row[url_key]:
+                            entry['url'] = row[url_key]
+                        video_data.append(entry)
+
                 self.log(f"--- Successfully loaded {len(video_data)} rows from CSV.")
                 return video_data
             except Exception as e:
@@ -117,14 +130,19 @@ class SmartSorterApp(tk.Tk):
         def clean_filename_for_matching(filename):
             name, _ = os.path.splitext(filename)
             patterns_to_remove = [
-                r'\s*\(1920p_30fps_H264-128kbit_AAC\)',r'\s*\(1920p_25fps_H264-128kbit_AAC\)', r'\s*\(BQ\)', r'\s*\(HQ\)',
+                r'\s*\(1920p_30fps_H264-128kbit_AAC\)', r'\s*\(1920p_25fps_H264-128kbit_AAC\)', r'\s*\(BQ\)', r'\s*\(HQ\)',
                 r'\s*¦\s*#shorts', r'\s*#shorts', r'Leo the Wildlife Ranger'
             ]
             cleaned_name = name
             for pattern in patterns_to_remove: cleaned_name = re.sub(pattern, '', cleaned_name, flags=re.IGNORECASE)
             cleaned_name = cleaned_name.replace('¦', '|').strip()
             return cleaned_name
-        
+
+        def sanitize_url_for_filename(url):
+            # Mimics JDownloader's conversion of URL to filename
+            # Replaces common illegal characters with underscores
+            return re.sub(r'[:/\\?*&"<>|]', '_', url)
+
         def find_best_match(cleaned_title, csv_data):
             best_score, best_match = 0, None
             for entry in csv_data:
@@ -158,10 +176,47 @@ class SmartSorterApp(tk.Tk):
 
         total_renamed_count = 0
         
-        # --- PHASE 1: HIGH-CONFIDENCE MATCHING ---
-        self.log("\n--- Starting Phase 1: High-Confidence Matching ---")
+        # --- PHASE 0: URL-BASED PERFECT MATCHING (NEW) ---
+        self.log("\n--- Starting Phase 0: URL-based Matching ---")
+        url_map = {sanitize_url_for_filename(entry['url']): entry for entry in video_data if 'url' in entry and entry['url']}
+        
+        if not url_map:
+            self.log("--- No valid URLs found in CSV. Skipping this phase. ---")
+        else:
+            files_in_folder = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and not f.endswith(".py")]
+            processed_in_this_phase = 0
+            for filename in files_in_folder:
+                filename_base, extension = os.path.splitext(filename)
+                
+                if filename_base in url_map:
+                    match_entry = url_map[filename_base]
+                    target_dir = None
+                    if extension.lower() in self.VIDEO_EXTENSIONS: target_dir = videos_dir
+                    elif extension.lower() in self.THUMBNAIL_EXTENSIONS: target_dir = thumbnails_dir
+                    else: continue
+                    
+                    original_title, index = match_entry['title'], match_entry['index']
+                    new_filename = f"{index} - {sanitize_for_filename(original_title)}{extension}"
+                    new_filepath = os.path.join(target_dir, new_filename)
+
+                    if not os.path.exists(new_filepath):
+                        self.log(f"MATCH (URL): '{filename}' -> '{os.path.relpath(new_filepath, folder_path)}'")
+                        try:
+                            os.rename(os.path.join(folder_path, filename), new_filepath)
+                            self.log("  -> RENAMED & MOVED")
+                            processed_in_this_phase += 1
+                        except Exception as e:
+                            self.log(f"  -> ERROR: Could not move/rename. Reason: {e}")
+                    else:
+                        self.log(f"INFO: Destination for '{filename}' already exists: '{new_filename}'. Skipped.")
+            
+            total_renamed_count += processed_in_this_phase
+            self.log(f"--- Processed {processed_in_this_phase} file(s) based on URL match. ---")
+
+
+        # --- PHASE 1: HIGH-CONFIDENCE FUZZY MATCHING ---
+        self.log("\n--- Starting Phase 1: High-Confidence Title Matching (for remaining files) ---")
         current_threshold = 0.6
-        # --- MODIFICATION HERE: The threshold at which we switch to Last Resort mode ---
         LAST_RESORT_THRESHOLD = 0.05
         pass_num = 1
         
@@ -188,7 +243,7 @@ class SmartSorterApp(tk.Tk):
                     new_filepath = os.path.join(target_dir, new_filename)
                     
                     if not os.path.exists(new_filepath):
-                        self.log(f"MATCH: '{filename}' -> '{os.path.relpath(new_filepath, folder_path)}' (Score: {score:.2f})")
+                        self.log(f"MATCH (Title): '{filename}' -> '{os.path.relpath(new_filepath, folder_path)}' (Score: {score:.2f})")
                         try:
                             os.rename(os.path.join(folder_path, filename), new_filepath)
                             self.log("  -> RENAMED & MOVED")
@@ -205,7 +260,7 @@ class SmartSorterApp(tk.Tk):
             pass_num += 1
 
         # --- PHASE 2: LAST RESORT MATCHING ---
-        self.log(f"\n\n--- Starting Phase 2: Last Resort Matching (For remaining files) ---")
+        self.log(f"\n\n--- Starting Phase 2: Last Resort Title Matching (For remaining files) ---")
         remaining_files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and not f.endswith(".py")]
         
         if not remaining_files:
@@ -218,8 +273,6 @@ class SmartSorterApp(tk.Tk):
                 
                 file_renamed = False
                 for match_info in all_matches:
-                    # In this phase, we only care if a match can be made at all, even with a low score.
-                    # Setting a floor at 0.01 to avoid completely unrelated matches.
                     if match_info['score'] < 0.01: 
                         break
 
