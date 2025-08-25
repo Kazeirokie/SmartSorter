@@ -17,6 +17,7 @@ class SmartSorterApp(tk.Tk):
         self.VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.mov', '.avi', '.wmv', '.webm']
         self.THUMBNAIL_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
         self.DECREMENT_STEP = 0.05
+        self.YOUTUBE_ID_MATCH_THRESHOLD = 0.8 # Corresponds to a 0.2 mismatch tolerance
 
         # --- GUI Widgets ---
         self.create_widgets()
@@ -66,6 +67,10 @@ class SmartSorterApp(tk.Tk):
             self.folder_path_var.set(folderpath)
             
     def log(self, message):
+        # Ensure UI updates happen on the main thread
+        self.after(0, self._log_update, message)
+        
+    def _log_update(self, message):
         self.log_widget.config(state='normal')
         self.log_widget.insert(tk.END, message + "\n")
         self.log_widget.config(state='disabled')
@@ -93,6 +98,14 @@ class SmartSorterApp(tk.Tk):
     def run_backend_logic(self, csv_path, folder_path):
         self.log("\n*** LIVE MODE IS ON. FILES WILL BE RENAMED AND MOVED. ***\n")
         
+        def extract_youtube_id(text):
+            """Extracts an 11-character YouTube ID from a URL or filename."""
+            if not text:
+                return None
+            # --- MODIFIED --- More specific regex to avoid ambiguity with full URLs as filenames
+            match = re.search(r'(?:watch\?v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})', text)
+            return match.group(1) if match else None
+
         def load_csv_data(filepath):
             if not os.path.exists(filepath):
                 self.log(f"--- ERROR: CSV file not found at '{filepath}'")
@@ -111,14 +124,15 @@ class SmartSorterApp(tk.Tk):
                         return None
                     
                     if url_key:
-                        self.log("--- Found 'url' column. Will prioritize URL matching.")
+                        self.log("--- Found 'url' column. Will prioritize YouTube ID matching.")
                     else:
                         self.log("--- No 'url' column found. Proceeding with title matching only.")
 
                     for row in reader:
                         entry = {'title': row[title_key], 'index': row[index_key]}
                         if url_key and row[url_key]:
-                            entry['url'] = row[url_key]
+                            # Extract and store the YouTube ID directly
+                            entry['youtube_id'] = extract_youtube_id(row[url_key])
                         video_data.append(entry)
 
                 self.log(f"--- Successfully loaded {len(video_data)} rows from CSV.")
@@ -137,11 +151,6 @@ class SmartSorterApp(tk.Tk):
             for pattern in patterns_to_remove: cleaned_name = re.sub(pattern, '', cleaned_name, flags=re.IGNORECASE)
             cleaned_name = cleaned_name.replace('¦', '|').strip()
             return cleaned_name
-
-        def sanitize_url_for_filename(url):
-            # Mimics JDownloader's conversion of URL to filename
-            # Replaces common illegal characters with underscores
-            return re.sub(r'[:/\\?*&"<>|]', '_', url)
 
         def find_best_match(cleaned_title, csv_data):
             best_score, best_match = 0, None
@@ -166,7 +175,7 @@ class SmartSorterApp(tk.Tk):
 
         video_data = load_csv_data(csv_path)
         if not video_data: 
-            self.start_button.config(state='normal', text="Start Processing")
+            self.after(0, lambda: self.start_button.config(state='normal', text="Start Processing"))
             return
 
         videos_dir = os.path.join(folder_path, "Videos")
@@ -176,20 +185,50 @@ class SmartSorterApp(tk.Tk):
 
         total_renamed_count = 0
         
-        # --- PHASE 0: URL-BASED PERFECT MATCHING (NEW) ---
-        self.log("\n--- Starting Phase 0: URL-based Matching ---")
-        url_map = {sanitize_url_for_filename(entry['url']): entry for entry in video_data if 'url' in entry and entry['url']}
+        # --- PHASE 0: YOUTUBE ID-BASED MATCHING ---
+        self.log("\n--- Starting Phase 0: YouTube ID Matching ---")
+        # Create a map of YouTube ID -> CSV data entry for fast lookups
+        id_map = {entry['youtube_id']: entry for entry in video_data if 'youtube_id' in entry and entry['youtube_id']}
         
-        if not url_map:
-            self.log("--- No valid URLs found in CSV. Skipping this phase. ---")
+        if not id_map:
+            self.log("--- No valid YouTube IDs found in CSV. Skipping this phase. ---")
         else:
             files_in_folder = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f)) and not f.endswith(".py")]
             processed_in_this_phase = 0
+            
             for filename in files_in_folder:
-                filename_base, extension = os.path.splitext(filename)
+                # Extract potential YouTube ID from the filename itself
+                id_from_filename = extract_youtube_id(filename)
+                if not id_from_filename:
+                    continue # Skip files that don't seem to have a YouTube ID
+
+                match_entry = None
+                match_type = ""
+                score = 1.0
+
+                # 1. Attempt Exact Match
+                if id_from_filename in id_map:
+                    match_entry = id_map[id_from_filename]
+                    match_type = "Exact ID"
                 
-                if filename_base in url_map:
-                    match_entry = url_map[filename_base]
+                # 2. Attempt Fuzzy Match if no exact match was found
+                else:
+                    best_id_score = 0
+                    best_id_match = None
+                    for csv_id, entry in id_map.items():
+                        similarity = SequenceMatcher(None, id_from_filename, csv_id).ratio()
+                        if similarity > best_id_score:
+                            best_id_score = similarity
+                            best_id_match = entry
+                    
+                    if best_id_score >= self.YOUTUBE_ID_MATCH_THRESHOLD:
+                        match_entry = best_id_match
+                        match_type = "Fuzzy ID"
+                        score = best_id_score
+
+                # If a match was found (either exact or fuzzy), process the file
+                if match_entry:
+                    _, extension = os.path.splitext(filename)
                     target_dir = None
                     if extension.lower() in self.VIDEO_EXTENSIONS: target_dir = videos_dir
                     elif extension.lower() in self.THUMBNAIL_EXTENSIONS: target_dir = thumbnails_dir
@@ -200,7 +239,7 @@ class SmartSorterApp(tk.Tk):
                     new_filepath = os.path.join(target_dir, new_filename)
 
                     if not os.path.exists(new_filepath):
-                        self.log(f"MATCH (URL): '{filename}' -> '{os.path.relpath(new_filepath, folder_path)}'")
+                        self.log(f"MATCH ({match_type}): '{filename}' -> '{os.path.relpath(new_filepath, folder_path)}' (Score: {score:.2f})")
                         try:
                             os.rename(os.path.join(folder_path, filename), new_filepath)
                             self.log("  -> RENAMED & MOVED")
@@ -211,7 +250,7 @@ class SmartSorterApp(tk.Tk):
                         self.log(f"INFO: Destination for '{filename}' already exists: '{new_filename}'. Skipped.")
             
             total_renamed_count += processed_in_this_phase
-            self.log(f"--- Processed {processed_in_this_phase} file(s) based on URL match. ---")
+            self.log(f"--- Processed {processed_in_this_phase} file(s) based on YouTube ID match. ---")
 
 
         # --- PHASE 1: HIGH-CONFIDENCE FUZZY MATCHING ---
@@ -316,7 +355,8 @@ class SmartSorterApp(tk.Tk):
             self.log("  Unmatched files remain in the root directory.")
         self.log("======================================================")
         
-        self.start_button.config(state='normal', text="Start Processing")
+        # Ensure the button is re-enabled on the main thread
+        self.after(0, lambda: self.start_button.config(state='normal', text="Start Processing"))
 
 if __name__ == "__main__":
     app = SmartSorterApp()
